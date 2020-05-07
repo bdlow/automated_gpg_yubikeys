@@ -1,0 +1,525 @@
+#!/usr/bin/env bash
+#
+# Create a GPG key and copy to one or more YubiKey Security Keys.
+#
+# Ths script operates in one of two modes:
+#  1. create GPG key
+#  2. copy a private key to one or more YubiKey smart cards
+#
+# WARNING: the YubiKey's OpenPGP applet will be reset, erasing all existing
+# configuration and key material.
+#
+# Arguments (one only is required)
+#  -g name,email            initialise GPG keys with the given name and email
+#  -y gpg_key_id,yk_id      copy the given GPG key to the given YubiKey
+#  -a                       change the card's Admin PIN (interactive)
+#  -u                       change the card's (user) PIN (interactive)
+#  -l                       list available YubiKey(s)
+#  -h                       this help
+#
+# GPG key mode options
+#  -G /path/to/gpg.conf     path to gpg.conf; default = gpg.conf is presumed to
+#                           be alongside this script
+#
+# Other
+#  -d                       check dependencies
+#  -f                       force; avoid prompting the user
+#  -p                       generate a passphrase
+#
+# Environment Variables
+# GNUPGHOME     GPG home directory [required]; an empty temporary directory is
+#               strongly recommended e.g.
+#               export GNUPGHOME=$(mktemp -d)
+# PASSPHRASE    temporary GPG key passphrase [optional] e.g.
+#               export PASSPHRASE=$(make_gpg_keys -p)
+#
+# Notes
+# Unfortunately both YubiKey manager (ykman) and GPG2 occasionally fail for
+# no apparent reason. In most cases simply retrying will work; if not, try
+# replugging the card.
+#
+###
+# Implementation notes
+# - this script checks that only one card is present at the start and assumes
+#   the same card is left in place for the duration; if you switch cards/etc
+#   whilst the script is running you're going to have a bad time
+#   - ykman permits selecting cards by serial no., gpg does not
+# - gpg is not terribly friendly wrt. non-interactive use: it provides three
+#   different mechanisms, none of which are complete so we have to use at least
+#   2 and 3:
+#   1 an unattended keygen mode that's only useful for creating primary keys
+#   2 a --quick-*/command-line-arguments mode that's still only useful for a
+#     handful of key operations
+#   3 a --batch/read-from-fd mode that's rather clunky but is the only thing
+#     available for some functions, e.g. --card-edit
+# - pretty much all gpg key passphrase and card PIN handling was derived
+#   experimentally - there is zero documentation on what secrets gpg or its
+#   agents will require at any moment in time (you can infer/guess, but when
+#   you have caching going on, your guess is often going to be wrong)
+#   - in other words, this seems subject to the whims of gpg developers and
+#     thus is probably rather fragile from release to release
+# - the gnupg doc notes that gpgme is the right way to programmatically
+#   perform GPG (key) operations; but who's got time for that...
+#   https://www.gnupg.org/documentation/manuals/gnupg/Unattended-Usage-of-GPG.html
+#   - mind you, gpgme does not seem to handle card management (PINs, etc)
+# - care should be taken to not expose the GPG key passphrase (PASSPHRASE) to
+#   the process list/etc: cmd <<< $PASSPHRASE rt. echo $PASSPHRASE | cmd
+#   - the card default PIN is not sensitive (it's well-known)
+
+set -o nounset
+set -o errexit
+
+declare SCRIPTNAME
+SCRIPTNAME=$(basename "$0")
+if [[ -z "${BASH_VERSINFO[0]}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+    echo "[${SCRIPTNAME}] requires bash version >= 4"
+    exit 1
+fi
+
+declare YKFORCE
+declare MODE
+declare YKID
+declare KEYUSERNAME
+declare KEYUSEREMAIL
+declare GPGKEYID
+declare GPGCONF
+GPGCONF="$(dirname "$0")"/gpg.conf
+
+declare KEYPRIMARYALG
+declare KEYSUBALG
+KEYPRIMARYALG=rsa2048
+KEYSUBALG=rsa2048
+
+# PINs at factory-reset
+declare -r DEFAULT_PIN=123456
+declare -r DEFAULT_ADMINPIN=12345678
+
+declare TPUT_RED TPUT_ORG TPUT_RST
+TPUT_RED=""
+TPUT_ORG=""
+TPUT_RST=""
+# only use terminal colouring for ttys and if tput is available
+if [[ -t 1 ]] && command -v tput >/dev/null; then
+    TPUT_RED="$(tput setaf 1)"
+    TPUT_ORG="$(tput setaf 3)"
+    TPUT_RST="$(tput sgr0)"
+fi
+
+raise() {
+    local IFS=
+    echo "${TPUT_RED}[${SCRIPTNAME}] $*${TPUT_RST}" >&2
+}
+
+info() {
+    local IFS=
+    echo "${TPUT_ORG}[${SCRIPTNAME}] $*${TPUT_RST}" >&2
+}
+
+function trap_exit {
+    rc=$?
+    if [[ $rc -ne 0 ]]; then raise "failed: $rc"; fi
+    gpg_stop_agent
+    exit $rc
+}
+trap trap_exit EXIT
+
+usage() {
+    # emit the front matter from this file; stop at either of ### or a
+    # non-comment line
+    sed >&2 -n "1d; /^###/q; /^#/!q; s/^# \{0,1\}//p;" "$0"
+}
+
+process_args() {
+    local OPTIND    # don't mess with our caller's OPTIND
+    while getopts ":audfg:G:y:lph" opt; do
+        case $opt in
+            :) raise "-${OPTARG} requires an argument" ;;
+            a) MODE=a ;;
+            u) MODE=u ;;
+            d) check_deps; exit 0 ;;
+            f) YKFORCE="-f" ;;
+            g) MODE=g; IFS=, read -r KEYUSERNAME KEYUSEREMAIL <<< "${OPTARG}" ;;
+            G) GPGCONF="${OPTARG}" ;;
+            y) MODE=y; IFS=, read -r GPGKEYID YKID <<< "${OPTARG}" ;;
+            l) yk_list; exit ;;
+            p) generate_passphrase; exit ;;
+            h|\?) usage; trap - EXIT; return 2;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    if [[ $# -gt 0 ]]; then
+        raise "unknown argument(s): [$*]"
+        return 2
+    fi
+    case ${MODE:-} in
+        g)
+            if [[ -z "${KEYUSERNAME-}" || -z "${KEYUSEREMAIL-}" ]]; then
+                raise "username and email are required"
+                return 2
+            fi
+            if [[ ! -v PASSPHRASE ]]; then
+                info "PASSPHRASE not set (using empty passphrase)"
+            fi
+        ;;
+        y)
+            if [[ -z "${GPGKEYID-}" || -z "${YKID-}" ]]; then
+                raise "GPG key ID and YubiKey ID are required"
+                return 2
+            fi
+        ;;
+        a|u) : ;;
+        *) raise "one of -g or -y is required"; return 2 ;;
+    esac
+}
+
+check_deps() {
+    # gpg's libexec utilities are not always installed on PATH
+    local libexecdir
+    libexecdir="$(gpgconf --list-dirs libexecdir 2>/dev/null || true)"
+    PATH="$PATH":"${libexecdir}"
+    rc=0
+    for p in gpg gpgconf gpg-connect-agent gpg-preset-passphrase; do
+        if ! command -v "$p" >/dev/null; then
+            raise "$p not found"
+            rc=1
+        fi
+    done
+    if ! gpg --version 2>/dev/null | grep -qE "^gpg \D+ 2\."; then
+        raise "gpg version 2 required"
+        rc=1
+    fi
+    if [[ -z "${GNUPGHOME+_}" || ! -d "${GNUPGHOME}" ]]; then
+        raise "GNUPGHOME not set/valid"
+        rc=1
+    fi
+    if [[ -z "${GPGCONF+_}" || ! -r "${GPGCONF}" ]]; then
+        raise "gpg.conf missing"
+        rc=1
+    fi
+
+    if ! command -v ykman >/dev/null; then
+        case ${MODE:-} in
+            y)
+                raise "YubiKey Manager (ykman) not found"
+                rc=1
+            ;;
+            *)
+                info "YubiKey Manager (ykman) not found (required for -y mode)"
+            ;;
+        esac
+    fi
+
+    [[ "$rc" -gt 0 ]] && return "$rc"
+
+    # gpg expects to interact with the terminal, e.g. for pinentry; when stdio
+    # is not connected to the controlling terminal (e.g. when reading from a
+    # pipe) GPG_TTY must be set instead
+    if [[ ! -v GPG_TTY ]]; then
+        GPG_TTY=$(tty)
+        export GPG_TTY
+    fi
+}
+
+generate_passphrase() {
+    # armored is 6 bits per character; thus the byte length should be
+    # a multiple of 6 bits in order to fill the armored string (i.e. multiple
+    # of 3 bytes)
+    gpg --gen-random --armor 1 12 2>/dev/null
+}
+
+gpg_stop_agent() {
+    gpgconf --kill gpg-agent 2>/dev/null
+}
+
+gpg_start_agent() {
+    info "starting gpg agent"
+    # explicitly include homedir arg so that it's clear in the process list
+    gpg-agent --homedir "${GNUPGHOME}" --daemon --allow-preset-passphrase \
+        --default-cache-ttl 60
+}
+
+gpg_create_primary_key() {
+    info "creating primary key"
+    # create a Certify-only key, returning the fingerprint of same
+    # - read the key fingerprint via status messages on a new fd
+    GPGKEYID=$(gpg --options "${GPGCONF}" --quiet \
+        --batch --status-fd=2 --passphrase-fd=0 --pinentry-mode=loopback \
+        --quick-generate-key "${KEYUSERNAME} <${KEYUSEREMAIL}>" \
+        "${KEYPRIMARYALG}" cert 0 2>&1 >/dev/null <<< "${PASSPHRASE}" \
+        | awk '$2=="KEY_CREATED" {print $4}'; exit "${PIPESTATUS[0]}")
+}
+
+gpg_create_subkey() {
+    info "creating subkey for key ID [$GPGKEYID]"
+    gpg --options "${GPGCONF}" --batch --passphrase-fd=0 \
+        --pinentry-mode=loopback --quick-add-key \
+        "${GPGKEYID}" "${KEYSUBALG}" encrypt 0 <<< "${PASSPHRASE}"
+}
+
+gpg_get_key_info() {
+    info "looking for GPG key [${GPGKEYID}]"
+    # can't catch the exit status from the read, so do a pre-check that the
+    # key actually exists
+    gpg --quiet --list-keys "${GPGKEYID}" >/dev/null
+
+    # extract the username and email from the key
+    IFS="<>" read -r KEYUSERNAME KEYUSEREMAIL _ <<< "$(gpg --with-colons \
+        --list-keys "${GPGKEYID}" | awk -F: '$1=="uid" { print $10 }')"
+    KEYUSERNAME="${KEYUSERNAME%"${KEYUSERNAME##*[![:space:]]}"}" # trim
+
+    info "  ID: ${KEYUSERNAME} <${KEYUSEREMAIL}>"
+}
+
+gpg_configure_card() {
+    info "configuring GPG card"
+    # construct a set of commands to change the card user data
+    # - we may or may not get a password prompt depending on whether the
+    #   card has cached it or not; provide the Admin PIN up front regardless
+    declare -a cmds
+    cmds=(
+        "${DEFAULT_ADMINPIN}"
+        "admin"
+    )
+    # name expects two arguments (lines) (last, first)
+    [[ -v KEYUSERNAME ]] && cmds+=("name" "${KEYUSERNAME}" "")
+    [[ -v KEYUSEREMAIL ]] && cmds+=("login" "${KEYUSEREMAIL}")
+
+    # the output from --card-edit is normally of no interest except on error
+    local -a gpgargs
+    local e
+    gpgargs=("--options" "${GPGCONF}" "--quiet" "--batch"
+             "--pinentry-mode=loopback" "--passphrase-fd=0" "--command-fd=0")
+    gpgargs+=("--card-edit")
+    e=$(printf "%s\n" "${cmds[@]}" | gpg  "${gpgargs[@]}" 2>&1) \
+        || ( rc="$?"; raise "$e"; exit "$rc" )
+}
+
+gpg_preset_card_pin() {
+    # pre-set the card PIN
+    # - strings prefixed w/ '/' are "control commands" to gpg-agent, they don't
+    #   return a status response
+    declare -a cmds
+    local cardserial
+    local pinstatus
+    cardserial=$(gpg-connect-agent 'scd serialno' /bye \
+        | awk '$2=="SERIALNO" { print $3 }')
+    cmds=(
+        "option pinentry-mode=loopback"
+        "/let pin ${DEFAULT_PIN}"
+        "/definq PASSPHRASE pin"
+        "scd checkpin ${cardserial}"
+        "/bye"
+    )
+    # - scd doesn't pass any kind of exit status out, so have to inspect the
+    #   output to figure out the result of checkpin - need an OK to each
+    #   non-/ command above
+    pinstatus=$(printf "%s\n" "${cmds[@]}" \
+        | gpg-connect-agent 2>&1 \
+        | grep -c '^OK$' )
+    if [[ "${pinstatus}" -ne 2 ]]; then
+        raise "pre-set card PIN failed"
+        return 1
+    fi
+}
+
+gpg_preset_key_passphrase() {
+    # pre-set the key passphrase
+    local keygrip
+    # primary key is listed first, followed by subkeys; need all three
+    while read -r keygrip; do
+        gpg-preset-passphrase -v --preset "${keygrip}" <<< "${PASSPHRASE}"
+    done < <(gpg --batch --with-colons --with-keygrip --list-keys \
+        "${GPGKEYID}" | awk -F: '$1=="grp" { print $10 }')
+}
+
+gpg_copy_to_card() {
+    info "copying keys to card"
+    # gpg does not provide a means to /copy/ a key to a card, it will only
+    # /move/ a key to a card (i.e. copy and delete the original); we want to
+    # keep the key in  the local keychain
+    # - there are two approaches to "undoing" the removal of the secret key:
+    #   1. make a backup of the secret key (via --export-secret-keys), or the
+    #      whole GPGHOME directory, and restore that after the move
+    #   2. do the move but don't commit changes to the local keychain
+    # - we're doing the latter
+
+    # key passphrase and card PIN:
+    # - keytocard requires *both* the key passphrase and card PIN however it
+    #   is not possible to provide both to gpg programmatically - the
+    #   passphrase-fd facility will read at most one secret
+    #   - fortunately the card PIN can be pre-cached
+    #     - the key passphrase can also be cached though keytocard will prompt
+    #       for it regardless of the cache
+
+    declare -a cmds
+    cmds=(
+        "${PASSPHRASE}"
+        "keytocard"
+        "y"       # Really move the primary key? (y/N)
+        "1"       # Your selection? (1: signing)
+        "key 1"
+        "keytocard"
+        "2"       # Your selection? (2: encryption)
+        "q"
+        "n"       # Save changes? (y/N)
+        "y"       # Quit without saving? (y/N)
+   )
+
+    # the output from edit-key is normally of no interest except on error
+    local -a gpgargs
+    local e
+    gpgargs=("--options" "${GPGCONF}" "--quiet" "--batch"
+             "--pinentry-mode=loopback" "--passphrase-fd=0" "--command-fd=0")
+    gpgargs+=("--edit-key" "${GPGKEYID}")
+    e=$(printf "%s\n" "${cmds[@]}" | gpg  "${gpgargs[@]}" 2>&1) \
+        || ( rc="$?"; raise "$e"; exit "$rc" )
+}
+
+_gpg_change_pin() {
+    local pintype
+    pintype="$1"
+    info "changing ${pintype^} PIN"
+    declare -A option
+    option=([user]=1 [admin]=3)
+    # construct a set of commands to change the card admin PIN
+    # - it's not possible to programmatically change a card Admin PIN, have
+    #   to do so semi-interactively (via pinentry)
+    # - GPG_TTY must be set (we're calling gpg within a pipeline)
+    # - this is done separately to gpg_configure_card as trying to change
+    #   both card data and Admin PIN pops up far too many PIN dialogs
+    declare -a cmds
+    cmds=(
+        "admin"
+        "passwd"
+        "${option[$1]}" # change PIN/Admin PIN; will raise a pinentry prompt
+        "q"
+        "q"
+    )
+
+    # gpg's exit status does not reflect the PIN change operation; rather
+    # have to examine the status fd for the outcome of the PIN change
+    # - card-edit emits prompts/etc on stderr; silenced by --no-tty
+    local -a gpgargs
+    gpgargs=("--options" "${GPGCONF}" "--quiet" "--no-tty"
+             "--command-fd=0" "--status-fd=2")
+    if ! printf "%s\n" "${cmds[@]}" \
+        | gpg "${gpgargs[@]}" --card-edit 2>&1 \
+        | grep -q "SC_OP_SUCCESS"
+    then
+        raise "${pintype^} PIN change failed (wrong initial PIN, " \
+                "new PIN too short, card locked)"
+        return 1
+    fi
+}
+
+gpg_change_pin() {
+    _gpg_change_pin user
+}
+
+gpg_change_admin_pin() {
+    _gpg_change_pin admin
+}
+
+
+gpg_export_pubkey() {
+    info "exporting public key to ${GPGKEYID}.pub"
+    gpg --armor --export "${GPGKEYID}" > "${GPGKEYID}.pub"
+}
+
+ykman_silent() {
+    # ykman occasionally barfs with a protocol error and Python traceback
+    ykman "$@" 2>/dev/null
+}
+
+yk_list() {
+    # get a list of keys; return error if other than one is present
+    local -a yubikeys
+    mapfile -t yubikeys < <( ykman_silent list )
+    if [[ ${#yubikeys[@]} -lt 1 ]]; then
+        raise "no YubiKey found"
+        return 1
+    fi
+
+    printf "%s\n" "${yubikeys[@]}"
+    if [[ ${#yubikeys[@]} -gt 1 ]]; then
+        raise "more than one YubiKey found"
+        return 1
+    fi
+}
+
+yk_count() {
+    yk_list >/dev/null
+}
+
+yk_find() {
+    info "Looking for security key with serial number [$YKID]"
+    ykman_silent --device "${YKID}" info
+}
+
+yk_configure() {
+    info "resetting YubiKey [${YKID}]"
+    # reset will prompt the user unless forced
+    ykman_silent --device "${YKID}" openpgp reset ${YKFORCE:-}
+    info "setting CCID mode"
+    ykman_silent --device "${YKID}" mode -f CCID >/dev/null
+}
+
+yk_set_touch_policy() {
+    info "configuring touch policy"
+    # ykman as of 3.1.0 occasionally silently fails to set a touch policy; it
+    # also fails to provide a means to check the card's policy
+    # - as a hacky workaround: when the policy is 'fixed', subsequent attempts
+    #   to change the policy at all should fail
+    local policy
+    for policy in sig enc aut; do
+        ykman_silent --device "${YKID}" openpgp set-touch -f \
+            -a "${DEFAULT_ADMINPIN}" "${policy}" fixed
+    done
+    # these should fail; alas we can't simply rely on ykman's exit status as
+    # ykman crashes fairly regularly (i.e. an "error" exit status could be due
+    # to the policy change failing (good), or ykman crashing (bad)); have to
+    # explicitly look for the error message (wtfbbq)
+    for policy in sig enc aut; do
+        ( ykman --device "${YKID}" openpgp set-touch -f \
+            -a "${DEFAULT_ADMINPIN}" "${policy}" on 2>&1 \
+            | grep -q "Touch policy not allowed" ) \
+            || ( raise "setting YubiKey touch policy failed"; return 1 )
+    done
+}
+
+main() {
+    process_args "$@"
+    check_deps
+
+    # start with a clean slate each invocation
+    gpg_stop_agent
+
+    case ${MODE} in
+        g)
+            gpg_create_primary_key
+            gpg_create_subkey
+            gpg_export_pubkey
+        ;;
+        y)
+            yk_count
+            yk_find
+            yk_configure
+            gpg_start_agent
+            gpg_get_key_info
+            gpg_configure_card
+            gpg_preset_card_pin
+            gpg_copy_to_card
+            # gpg's card ops blows away the touch policy, so do this last
+            yk_set_touch_policy
+        ;;
+        u) gpg_change_pin ;;
+        a) gpg_change_admin_pin ;;
+        *) return 1  ;;
+    esac
+    info "done"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]
+then
+  main "$@"
+fi
